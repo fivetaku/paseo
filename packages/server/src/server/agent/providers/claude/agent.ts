@@ -60,7 +60,12 @@ import { foldSubagentObservations, type SubagentObservation } from "./subagents/
 import { observeReplayWorkflows } from "./subagents/workflow-replay-source.js";
 import { limitAgentTimelineItemContent } from "../../agent-timeline-content.js";
 import { readClaudeWorkflowResultFile } from "./subagents/workflow-output.js";
-import { buildClaudeFeatures, claudeModelSupportsFastMode } from "./feature-definitions.js";
+import {
+  buildClaudeFeatures,
+  CLAUDE_ULTRACODE_FEATURE_ID,
+  claudeModelSupportsFastMode,
+  claudeModelSupportsUltracode,
+} from "./feature-definitions.js";
 import {
   buildBinaryDiagnosticRows,
   buildCommandResolutionDiagnosticRows,
@@ -547,6 +552,18 @@ function isClaudeThinkingOption(value: string | null | undefined): value is Clau
     value === CLAUDE_DISABLED_THINKING_OPTION_ID ||
     value === CLAUDE_ULTRACODE_THINKING_OPTION_ID ||
     isClaudeThinkingEffort(value)
+  );
+}
+
+function isClaudeUltracodeRequested(config: {
+  featureValues?: Record<string, unknown>;
+  thinkingOptionId?: string;
+}): boolean {
+  return (
+    config.featureValues?.[CLAUDE_ULTRACODE_FEATURE_ID] === true ||
+    // COMPAT(claudeUltracodeThinkingOption): added in v0.14.0, remove after 2027-04-28 once app floor >= v0.14.0.
+    // Saved sessions and older apps select Ultracode as a thinking option.
+    config.thinkingOptionId === CLAUDE_ULTRACODE_THINKING_OPTION_ID
   );
 }
 
@@ -1723,6 +1740,7 @@ export class ClaudeAgentClient implements AgentClient {
     return buildClaudeFeatures({
       modelId: claudeConfig.model,
       fastModeEnabled: claudeConfig.featureValues?.fast_mode === true,
+      ultracodeEnabled: isClaudeUltracodeRequested(claudeConfig),
     });
   }
 
@@ -2416,6 +2434,7 @@ class ClaudeAgentSession implements AgentSession {
     return buildClaudeFeatures({
       modelId: this.config.model,
       fastModeEnabled: this.config.featureValues?.fast_mode === true,
+      ultracodeEnabled: isClaudeUltracodeRequested(this.config),
     });
   }
 
@@ -2717,6 +2736,12 @@ class ClaudeAgentSession implements AgentSession {
     if (!claudeModelSupportsFastMode(this.config.model) && this.config.featureValues?.fast_mode) {
       await this.applyFastModeFeature(false, activeQuery);
     }
+    if (
+      !claudeModelSupportsUltracode(this.config.model) &&
+      isClaudeUltracodeRequested(this.config)
+    ) {
+      await this.applyUltracodeFeature(false, activeQuery);
+    }
     this.contextUsage.setInitialContextWindowMaxTokens(
       getClaudeContextWindowMaxTokens(this.config.model),
     );
@@ -2768,6 +2793,16 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   async setFeature(featureId: string, value: unknown): Promise<void> {
+    if (featureId === CLAUDE_ULTRACODE_FEATURE_ID) {
+      const enabled = Boolean(value);
+      if (enabled && !claudeModelSupportsUltracode(this.config.model)) {
+        throw new Error(
+          `Claude Ultracode is not available for model '${this.config.model ?? "default"}'`,
+        );
+      }
+      await this.applyUltracodeFeature(enabled);
+      return;
+    }
     if (featureId !== "fast_mode") {
       throw new Error(`Unknown Claude feature: ${featureId}`);
     }
@@ -2790,6 +2825,32 @@ class ClaudeAgentSession implements AgentSession {
     const activeQuery = query ?? this.query;
     if (activeQuery) {
       await activeQuery.applyFlagSettings({ fastMode: enabled });
+    }
+    this.cachedRuntimeInfo = null;
+  }
+
+  // Ultracode goes through the flag-settings control request rather than the launch
+  // `settings` option, so it toggles without restarting the query and never replaces a
+  // `--settings` file the provider command already passes. Turning it off clears the flag
+  // layer, so an `ultracode` value from the user's own settings files applies again.
+  private async applyUltracodeFeature(enabled: boolean, query?: Query): Promise<void> {
+    this.config.featureValues = {
+      ...this.config.featureValues,
+      [CLAUDE_ULTRACODE_FEATURE_ID]: enabled,
+    };
+    // COMPAT(claudeUltracodeThinkingOption): added in v0.14.0, remove after 2027-04-28 once app floor >= v0.14.0.
+    // A session on the old "ultracode" thinking option keeps its xhigh effort when the toggle turns off.
+    if (!enabled && this.config.thinkingOptionId === CLAUDE_ULTRACODE_THINKING_OPTION_ID) {
+      this.config.thinkingOptionId = "xhigh";
+      this.pushEvent({
+        type: "thinking_option_changed",
+        provider: "claude",
+        thinkingOptionId: this.config.thinkingOptionId,
+      });
+    }
+    const activeQuery = query ?? this.query;
+    if (activeQuery) {
+      await activeQuery.applyFlagSettings({ ultracode: enabled ? true : null });
     }
     this.cachedRuntimeInfo = null;
   }
@@ -3493,6 +3554,9 @@ class ClaudeAgentSession implements AgentSession {
     if (fastMode !== null) {
       await this.query.applyFlagSettings({ fastMode });
     }
+    if (this.resolveUltracodeSetting()) {
+      await this.query.applyFlagSettings({ ultracode: true });
+    }
     // Do not kick off background control-plane queries here. Methods like
     // supportedCommands()/setPermissionMode() may execute immediately after
     // ensureQuery() (for listCommands()/setMode()), and sharing the same query
@@ -3549,7 +3613,6 @@ class ClaudeAgentSession implements AgentSession {
   private resolveThinkingConfig(): {
     thinking: ClaudeOptions["thinking"];
     effort: ClaudeOptions["effort"];
-    ultracode: boolean;
   } {
     const thinkingOptionId =
       this.config.thinkingOptionId && this.config.thinkingOptionId !== "default"
@@ -3557,23 +3620,23 @@ class ClaudeAgentSession implements AgentSession {
         : undefined;
     assertClaudeThinkingOptionSupported(this.config.model, thinkingOptionId);
     if (thinkingOptionId === CLAUDE_DISABLED_THINKING_OPTION_ID) {
-      return { thinking: { type: "disabled" }, effort: undefined, ultracode: false };
+      return { thinking: { type: "disabled" }, effort: undefined };
     }
+    // COMPAT(claudeUltracodeThinkingOption): added in v0.14.0, remove after 2027-04-28 once app floor >= v0.14.0.
+    // The old "ultracode" thinking option means xhigh effort with Ultracode on.
     if (thinkingOptionId === CLAUDE_ULTRACODE_THINKING_OPTION_ID) {
       return {
         thinking: { type: "adaptive", display: "summarized" },
         effort: "xhigh",
-        ultracode: true,
       };
     }
     if (thinkingOptionId && isClaudeThinkingEffort(thinkingOptionId)) {
       return {
         thinking: { type: "adaptive", display: "summarized" },
         effort: thinkingOptionId,
-        ultracode: false,
       };
     }
-    return { thinking: undefined, effort: undefined, ultracode: false };
+    return { thinking: undefined, effort: undefined };
   }
 
   private buildAppendedSystemPrompt(): string {
@@ -3606,13 +3669,13 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private async buildOptions(permissionMode: PermissionMode): Promise<ClaudeOptions> {
-    const { thinking, effort, ultracode } = this.resolveThinkingConfig();
+    const { thinking, effort } = this.resolveThinkingConfig();
     const appendedSystemPrompt = this.buildAppendedSystemPrompt();
     const providerOptions = applyClaudeToolPolicy(
       this.config.providerOptions,
       this.config.toolPolicy,
     );
-    const settingsOptions = this.buildSettingsOptions(providerOptions, { ultracode });
+    const settingsOptions = this.buildSettingsOptions(providerOptions);
     const sdkEnv = this.harnessEnvironment;
     assertClaudeModeCanRun(permissionMode, sdkEnv);
 
@@ -3699,22 +3762,26 @@ class ClaudeAgentSession implements AgentSession {
 
   private buildSettingsOptions(
     providerOptions: ClaudeProviderOptions,
-    input: { ultracode: boolean },
   ): Pick<ClaudeOptions, "settings"> | Record<string, never> {
     const fastMode = this.resolveFastModeSetting();
     // Internal agents do daemon work such as naming a branch, so the user's and
     // project's hooks must not run for them.
     const disableAllHooks = this.config.internal === true;
-    if (fastMode === null && !input.ultracode && !disableAllHooks) {
+    if (fastMode === null && !disableAllHooks) {
       return {};
     }
     return {
       settings: mergeClaudeSettings(providerOptions.settings, {
         ...(fastMode === null ? {} : { fastMode }),
-        ...(input.ultracode ? { ultracode: true } : {}),
         ...(disableAllHooks ? { disableAllHooks: true } : {}),
       }),
     };
+  }
+
+  private resolveUltracodeSetting(): boolean {
+    return (
+      claudeModelSupportsUltracode(this.config.model) && isClaudeUltracodeRequested(this.config)
+    );
   }
 
   private resolveFastModeSetting(): boolean | null {

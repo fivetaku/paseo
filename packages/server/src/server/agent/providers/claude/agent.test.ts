@@ -512,7 +512,7 @@ describe("ClaudeAgentClient.fetchCatalog", () => {
     }
   });
 
-  test("exposes Ultra Code on xhigh-capable Claude models", async () => {
+  test("keeps Ultracode out of the thinking options, which list effort levels only", async () => {
     const emptyConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-claude-models-empty-"));
     try {
       const client = new ClaudeAgentClient({
@@ -538,21 +538,20 @@ describe("ClaudeAgentClient.fetchCatalog", () => {
         return models.find((model) => model.id === modelId)?.thinkingOptions?.map(({ id }) => id);
       };
 
-      expect(getThinkingIds("claude-opus-5")).toContain("ultracode");
+      expect(getThinkingIds("claude-opus-5")).not.toContain("ultracode");
       expect(getThinkingIds("claude-mythos-5-1")).toEqual([
         "low",
         "medium",
         "high",
         "xhigh",
         "max",
-        "ultracode",
       ]);
-      expect(getThinkingIds("claude-fable-5-1")).toContain("ultracode");
-      expect(getThinkingIds("claude-fable-5")).toContain("ultracode");
-      expect(getThinkingIds("claude-opus-4-8[1m]")).toContain("ultracode");
-      expect(getThinkingIds("claude-opus-4-8")).toContain("ultracode");
+      expect(getThinkingIds("claude-fable-5-1")).not.toContain("ultracode");
+      expect(getThinkingIds("claude-fable-5")).not.toContain("ultracode");
+      expect(getThinkingIds("claude-opus-4-8[1m]")).not.toContain("ultracode");
+      expect(getThinkingIds("claude-opus-4-8")).not.toContain("ultracode");
       expect(getThinkingIds("claude-sonnet-5")).toContain("xhigh");
-      expect(getThinkingIds("claude-sonnet-5")).toContain("ultracode");
+      expect(getThinkingIds("claude-sonnet-5")).not.toContain("ultracode");
       expect(getThinkingIds("claude-haiku-5-5")).toEqual([
         "off",
         "low",
@@ -560,13 +559,11 @@ describe("ClaudeAgentClient.fetchCatalog", () => {
         "high",
         "xhigh",
         "max",
-        "ultracode",
       ]);
       expect(getThinkingIds("claude-sonnet-5-5")).toContain("xhigh");
       expect(getThinkingIds("claude-sonnet-5-5")).not.toContain("off");
-      expect(getThinkingIds("claude-opus-4-7[1m]")).toContain("ultracode");
-      expect(getThinkingIds("claude-opus-4-7")).toContain("ultracode");
-      expect(getThinkingIds("claude-sonnet-4-6")).not.toContain("ultracode");
+      expect(getThinkingIds("claude-opus-4-7[1m]")).not.toContain("ultracode");
+      expect(getThinkingIds("claude-opus-4-7")).not.toContain("ultracode");
     } finally {
       await fs.rm(emptyConfigDir, { recursive: true, force: true });
     }
@@ -889,62 +886,58 @@ describe("ClaudeAgentSession features", () => {
 
   test("lists fast mode only for supported Opus models", async () => {
     const client = new ClaudeAgentClient({ logger, resolveBinary: async () => "/test/claude/bin" });
+    const getFastMode = async (model: string) => {
+      const features = await client.listFeatures({ provider: "claude", cwd: process.cwd(), model });
+      return features.find((feature) => feature.id === "fast_mode");
+    };
 
-    await expect(
-      client.listFeatures({
+    for (const model of [
+      "claude-opus-4-8",
+      "claude-opus-4-8[1m]",
+      "claude-opus-4-8-20260101",
+      "claude-opus-5",
+    ]) {
+      expect(await getFastMode(model)).toEqual(
+        expect.objectContaining({ id: "fast_mode", value: false }),
+      );
+    }
+    for (const model of [
+      "openrouter/anthropic/claude-opus-4-8",
+      "claude-sonnet-5",
+      "claude-sonnet-4-6",
+    ]) {
+      expect(await getFastMode(model)).toBeUndefined();
+    }
+  });
+
+  test("lists the Ultracode toggle for xhigh-capable models, including gateway model IDs", async () => {
+    const client = new ClaudeAgentClient({ logger, resolveBinary: async () => "/test/claude/bin" });
+    const getUltracode = async (model: string, featureValues?: Record<string, unknown>) => {
+      const features = await client.listFeatures({
         provider: "claude",
         cwd: process.cwd(),
-        model: "claude-opus-4-8",
-      }),
-    ).resolves.toEqual([expect.objectContaining({ id: "fast_mode", value: false })]);
+        model,
+        featureValues,
+      });
+      return features.find((feature) => feature.id === "ultracode");
+    };
 
-    await expect(
-      client.listFeatures({
-        provider: "claude",
-        cwd: process.cwd(),
-        model: "claude-opus-4-8[1m]",
-      }),
-    ).resolves.toEqual([expect.objectContaining({ id: "fast_mode", value: false })]);
-
-    await expect(
-      client.listFeatures({
-        provider: "claude",
-        cwd: process.cwd(),
-        model: "claude-opus-4-8-20260101",
-      }),
-    ).resolves.toEqual([expect.objectContaining({ id: "fast_mode", value: false })]);
-
-    await expect(
-      client.listFeatures({
-        provider: "claude",
-        cwd: process.cwd(),
-        model: "claude-opus-5",
-      }),
-    ).resolves.toEqual([expect.objectContaining({ id: "fast_mode", value: false })]);
-
-    await expect(
-      client.listFeatures({
-        provider: "claude",
-        cwd: process.cwd(),
-        model: "openrouter/anthropic/claude-opus-4-8",
-      }),
-    ).resolves.toEqual([]);
-
-    await expect(
-      client.listFeatures({
-        provider: "claude",
-        cwd: process.cwd(),
-        model: "claude-sonnet-5",
-      }),
-    ).resolves.toEqual([]);
-
-    await expect(
-      client.listFeatures({
-        provider: "claude",
-        cwd: process.cwd(),
-        model: "claude-sonnet-4-6",
-      }),
-    ).resolves.toEqual([]);
+    for (const model of [
+      "claude-opus-5-5",
+      "claude-opus-4-8[1m]",
+      "claude-sonnet-5",
+      "openrouter/anthropic/claude-opus-4-8",
+      "gateway--claude-opus-5-5[1m]",
+    ]) {
+      expect(await getUltracode(model)).toEqual(
+        expect.objectContaining({ type: "toggle", id: "ultracode", value: false }),
+      );
+    }
+    expect(await getUltracode("claude-opus-5-5", { ultracode: true })).toEqual(
+      expect.objectContaining({ id: "ultracode", value: true }),
+    );
+    expect(await getUltracode("claude-sonnet-4-6")).toBeUndefined();
+    expect(await getUltracode("custom-model")).toBeUndefined();
   });
 
   test("passes initial fast mode through Claude flag settings", async () => {
@@ -1066,8 +1059,8 @@ describe("ClaudeAgentSession features", () => {
     ]);
   });
 
-  test("maps Ultracode to xhigh effort and Claude ultracode settings", async () => {
-    const { queryFactory } = createQueryMock();
+  test("keeps the legacy Ultracode thinking option as xhigh effort with Ultracode on", async () => {
+    const { queryFactory, queryMock } = createQueryMock();
     const client = new ClaudeAgentClient({
       logger,
       queryFactory,
@@ -1084,11 +1077,98 @@ describe("ClaudeAgentSession features", () => {
       turnId: expect.stringMatching(/^foreground-turn-/),
     });
 
-    expect(queryFactory.mock.calls[0]?.[0].options).toMatchObject({
+    const options = queryFactory.mock.calls[0]?.[0].options;
+    expect(options).toMatchObject({
       effort: "xhigh",
       thinking: { type: "adaptive", display: "summarized" },
-      settings: { ultracode: true },
     });
+    expect(options?.settings).not.toMatchObject({ ultracode: true });
+    expect(queryMock.applyFlagSettings).toHaveBeenCalledWith({ ultracode: true });
+    expect(session.features).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "ultracode", value: true })]),
+    );
+
+    await session.close();
+  });
+
+  test("toggles Ultracode on the active query without changing effort or restarting", async () => {
+    const { queryFactory, queryMock } = createQueryMock();
+    const client = new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+      model: "claude-opus-5-5",
+      thinkingOptionId: "medium",
+    });
+
+    await (
+      session as unknown as {
+        ensureQuery(): Promise<unknown>;
+      }
+    ).ensureQuery();
+    await session.setFeature?.("ultracode", true);
+
+    expect(queryMock.applyFlagSettings).toHaveBeenLastCalledWith({ ultracode: true });
+    expect(queryFactory.mock.calls[0]?.[0].options).toMatchObject({ effort: "medium" });
+    expect(session.features).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "ultracode", value: true })]),
+    );
+
+    // Off clears the flag layer so an `ultracode` value in the user's settings applies again.
+    await session.setFeature?.("ultracode", false);
+
+    expect(queryMock.applyFlagSettings).toHaveBeenLastCalledWith({ ultracode: null });
+    expect(queryFactory).toHaveBeenCalledTimes(1);
+    expect(queryMock.close).not.toHaveBeenCalled();
+    expect(queryMock.return).not.toHaveBeenCalled();
+
+    await session.close();
+  });
+
+  test("applies a saved Ultracode toggle when the query starts", async () => {
+    const { queryFactory, queryMock } = createQueryMock();
+    const client = new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+      model: "claude-opus-5-5",
+      featureValues: { ultracode: true },
+    });
+
+    await expect(session.startTurn("hello")).resolves.toEqual({
+      turnId: expect.stringMatching(/^foreground-turn-/),
+    });
+
+    expect(queryFactory.mock.calls[0]?.[0].options?.settings).toEqual({ fastMode: false });
+    expect(queryMock.applyFlagSettings).toHaveBeenCalledWith({ ultracode: true });
+
+    await session.close();
+  });
+
+  test("rejects the Ultracode toggle on models without xhigh effort", async () => {
+    const { queryFactory } = createQueryMock();
+    const client = new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+      model: "claude-sonnet-4-6",
+    });
+
+    await expect(session.setFeature?.("ultracode", true)).rejects.toThrow(
+      "Claude Ultracode is not available for model 'claude-sonnet-4-6'",
+    );
 
     await session.close();
   });
