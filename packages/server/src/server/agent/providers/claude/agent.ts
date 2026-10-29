@@ -63,6 +63,8 @@ import { readClaudeWorkflowResultFile } from "./subagents/workflow-output.js";
 import {
   buildClaudeFeatures,
   CLAUDE_ULTRACODE_FEATURE_ID,
+  CLAUDE_ULTRACODE_OFF,
+  CLAUDE_ULTRACODE_ON,
   claudeModelSupportsFastMode,
   claudeModelSupportsUltracode,
 } from "./feature-definitions.js";
@@ -560,7 +562,7 @@ function isClaudeUltracodeRequested(config: {
   thinkingOptionId?: string;
 }): boolean {
   return (
-    config.featureValues?.[CLAUDE_ULTRACODE_FEATURE_ID] === true ||
+    config.featureValues?.[CLAUDE_ULTRACODE_FEATURE_ID] === CLAUDE_ULTRACODE_ON ||
     // COMPAT(claudeUltracodeThinkingOption): added in v0.14.0, remove after 2027-04-28 once app floor >= v0.14.0.
     // Saved sessions and older apps select Ultracode as a thinking option.
     config.thinkingOptionId === CLAUDE_ULTRACODE_THINKING_OPTION_ID
@@ -2447,6 +2449,7 @@ class ClaudeAgentSession implements AgentSession {
       sessionId: this.claudeSessionId,
       model: this.lastOptionsModel,
       modeId: this.currentMode ?? null,
+      ...this.legacyUltracodeRuntimeThinking(),
       ...(this.lastRuntimeModel
         ? {
             extra: {
@@ -2474,6 +2477,7 @@ class ClaudeAgentSession implements AgentSession {
       sessionId: this.claudeSessionId,
       model: this.lastOptionsModel,
       modeId: this.currentMode ?? null,
+      ...this.legacyUltracodeRuntimeThinking(),
     };
 
     if (!this.claudeSessionId) {
@@ -2731,16 +2735,17 @@ class ClaudeAgentSession implements AgentSession {
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId.trim() : null;
     const activeQuery = await this.ensureQuery();
     await activeQuery.setModel(normalizedModelId ?? undefined);
+    const previousUltracode = this.resolveUltracodeSetting();
     this.config.model = normalizedModelId ?? undefined;
     this.reconcileThinkingOptionForModel(normalizedModelId);
     if (!claudeModelSupportsFastMode(this.config.model) && this.config.featureValues?.fast_mode) {
       await this.applyFastModeFeature(false, activeQuery);
     }
-    if (
-      !claudeModelSupportsUltracode(this.config.model) &&
-      isClaudeUltracodeRequested(this.config)
-    ) {
-      await this.applyUltracodeFeature(false, activeQuery);
+    // The Ultracode choice stays as the user made it, so it is back when they return to an
+    // xhigh-capable model; only the running process follows what the new model takes.
+    const ultracode = this.resolveUltracodeSetting();
+    if (ultracode !== previousUltracode) {
+      await activeQuery.applyFlagSettings({ ultracode });
     }
     this.contextUsage.setInitialContextWindowMaxTokens(
       getClaudeContextWindowMaxTokens(this.config.model),
@@ -2787,6 +2792,7 @@ class ClaudeAgentSession implements AgentSession {
       throw new Error(`Unknown thinking option: ${normalizedThinkingOptionId}`);
     }
     this.queryRestartNeeded = true;
+    this.cachedRuntimeInfo = null;
     if (this.activeForegroundTurnId || this.autonomousTurn) {
       return THINKING_APPLIES_NEXT_TURN_NOTICE;
     }
@@ -2794,7 +2800,10 @@ class ClaudeAgentSession implements AgentSession {
 
   async setFeature(featureId: string, value: unknown): Promise<void> {
     if (featureId === CLAUDE_ULTRACODE_FEATURE_ID) {
-      const enabled = Boolean(value);
+      if (value !== CLAUDE_ULTRACODE_ON && value !== CLAUDE_ULTRACODE_OFF) {
+        throw new Error(`Unknown Claude Ultracode option: ${String(value)}`);
+      }
+      const enabled = value === CLAUDE_ULTRACODE_ON;
       if (enabled && !claudeModelSupportsUltracode(this.config.model)) {
         throw new Error(
           `Claude Ultracode is not available for model '${this.config.model ?? "default"}'`,
@@ -2830,13 +2839,12 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   // Ultracode goes through the flag-settings control request rather than the launch
-  // `settings` option, so it toggles without restarting the query and never replaces a
-  // `--settings` file the provider command already passes. Turning it off clears the flag
-  // layer, so an `ultracode` value from the user's own settings files applies again.
+  // `settings` option, so it switches without restarting the query and never replaces a
+  // `--settings` file the provider command already passes.
   private async applyUltracodeFeature(enabled: boolean, query?: Query): Promise<void> {
     this.config.featureValues = {
       ...this.config.featureValues,
-      [CLAUDE_ULTRACODE_FEATURE_ID]: enabled,
+      [CLAUDE_ULTRACODE_FEATURE_ID]: enabled ? CLAUDE_ULTRACODE_ON : CLAUDE_ULTRACODE_OFF,
     };
     // COMPAT(claudeUltracodeThinkingOption): added in v0.14.0, remove after 2027-04-28 once app floor >= v0.14.0.
     // A session on the old "ultracode" thinking option keeps its xhigh effort when the toggle turns off.
@@ -2850,7 +2858,7 @@ class ClaudeAgentSession implements AgentSession {
     }
     const activeQuery = query ?? this.query;
     if (activeQuery) {
-      await activeQuery.applyFlagSettings({ ultracode: enabled ? true : null });
+      await activeQuery.applyFlagSettings({ ultracode: this.resolveUltracodeSetting() });
     }
     this.cachedRuntimeInfo = null;
   }
@@ -3554,8 +3562,9 @@ class ClaudeAgentSession implements AgentSession {
     if (fastMode !== null) {
       await this.query.applyFlagSettings({ fastMode });
     }
-    if (this.resolveUltracodeSetting()) {
-      await this.query.applyFlagSettings({ ultracode: true });
+    const ultracode = this.resolveUltracodeSetting();
+    if (ultracode !== null) {
+      await this.query.applyFlagSettings({ ultracode });
     }
     // Do not kick off background control-plane queries here. Methods like
     // supportedCommands()/setPermissionMode() may execute immediately after
@@ -3778,10 +3787,30 @@ class ClaudeAgentSession implements AgentSession {
     };
   }
 
-  private resolveUltracodeSetting(): boolean {
-    return (
-      claudeModelSupportsUltracode(this.config.model) && isClaudeUltracodeRequested(this.config)
-    );
+  // COMPAT(claudeUltracodeThinkingOption): added in v0.14.0, remove after 2027-04-28 once app floor >= v0.14.0.
+  // The old "ultracode" thinking option is not in the effort list anymore, so the session reports
+  // the effort it runs at; the stored option keeps Ultracode on through isClaudeUltracodeRequested.
+  private legacyUltracodeRuntimeThinking(): Pick<AgentRuntimeInfo, "thinkingOptionId"> {
+    return this.config.thinkingOptionId === CLAUDE_ULTRACODE_THINKING_OPTION_ID
+      ? { thinkingOptionId: "xhigh" }
+      : {};
+  }
+
+  /**
+   * The `ultracode` flag the running process should have: the user's explicit choice on an
+   * xhigh-capable model, so "off" holds even when their own settings file turns it on. Null
+   * leaves the flag layer empty: no choice made, or a model that cannot run it.
+   */
+  private resolveUltracodeSetting(): boolean | null {
+    if (!claudeModelSupportsUltracode(this.config.model)) {
+      return null;
+    }
+    if (isClaudeUltracodeRequested(this.config)) {
+      return true;
+    }
+    return this.config.featureValues?.[CLAUDE_ULTRACODE_FEATURE_ID] === CLAUDE_ULTRACODE_OFF
+      ? false
+      : null;
   }
 
   private resolveFastModeSetting(): boolean | null {
